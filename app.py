@@ -44,12 +44,14 @@ logger = logging.getLogger(__name__)
 # ============================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DOWNLOAD_DIR = os.path.join(BASE_DIR, "downloads")
+PREVIEW_DIR = os.path.join(BASE_DIR, "previews")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+os.makedirs(PREVIEW_DIR, exist_ok=True)
 INDEX_FILE = os.path.join(BASE_DIR, "index.html")
 
 
 # ============================================================
-# PROXY SELETIVO — só usa proxy onde realmente precisa
+# PROXY SELETIVO
 # ============================================================
 PROXY_REQUIRED_DOMAINS = (
     "youtube.com",
@@ -61,7 +63,6 @@ PROXY_REQUIRED_DOMAINS = (
 
 
 def needs_proxy(url: str) -> bool:
-    """Retorna True se a URL precisa passar pelo proxy."""
     try:
         host = (urlparse(url).hostname or "").lower()
         if host.startswith("www."):
@@ -72,7 +73,7 @@ def needs_proxy(url: str) -> bool:
 
 
 # ============================================================
-# COOKIES — copia para /tmp/ (gravável) porque /etc/secrets é read-only
+# COOKIES
 # ============================================================
 COOKIES_FILE = None
 _candidates = ["/etc/secrets/cookies.txt", os.path.join(BASE_DIR, "cookies.txt")]
@@ -134,7 +135,7 @@ DENO_PATH = find_deno()
 # ============================================================
 # APP
 # ============================================================
-app = FastAPI(title="NeonVD API", version="2.3.0")
+app = FastAPI(title="NeonVD API", version="2.4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -162,7 +163,7 @@ async def health():
         "proxy": bool(PROXY_URL),
         "server": IS_SERVER,
         "cache_size": len(analyze_cache),
-        "proxy_required_domains": list(PROXY_REQUIRED_DOMAINS),
+        "previews": len(previews_state),
     }
 
 
@@ -170,12 +171,12 @@ async def health():
 # ESTADO
 # ============================================================
 tasks_state: Dict[str, Dict[str, Any]] = {}
+previews_state: Dict[str, Dict[str, Any]] = {}
 connections: Dict[str, WebSocket] = {}
 state_lock = threading.Lock()
 
-# Cache de análises (economiza proxy em URLs repetidas)
 analyze_cache: Dict[str, dict] = {}
-CACHE_TTL = 3600  # 1 hora
+CACHE_TTL = 3600
 
 
 class AnalyzeRequest(BaseModel):
@@ -186,6 +187,10 @@ class DownloadRequest(BaseModel):
     url: str
     format: str
     quality: str = "best"
+
+
+class PreviewRequest(BaseModel):
+    url: str
 
 
 # ============================================================
@@ -205,13 +210,10 @@ def clean_ansi(t: str) -> str:
 
 def base_opts(use_proxy: bool = True) -> Dict[str, Any]:
     opts: Dict[str, Any] = {
-        # ---------- Básico ----------
         "quiet": True,
         "no_warnings": True,
         "http_headers": {"User-Agent": USER_AGENT},
         "noplaylist": True,
-
-        # ---------- PERFORMANCE ----------
         "concurrent_fragment_downloads": 8,
         "http_chunk_size": 10 * 1024 * 1024,
         "buffersize": 1024 * 1024,
@@ -226,12 +228,9 @@ def base_opts(use_proxy: bool = True) -> Dict[str, Any]:
         opts["ffmpeg_location"] = FFMPEG_LOCATION
     if COOKIES_FILE:
         opts["cookiefile"] = COOKIES_FILE
-
-    # ✅ Proxy seletivo
     if use_proxy and PROXY_URL:
         opts["proxy"] = PROXY_URL
 
-    # Multi-cliente do YouTube (um sempre libera)
     opts["extractor_args"] = {
         "youtube": {
             "player_client": ["web_safari", "web", "android", "ios", "tv"],
@@ -240,9 +239,6 @@ def base_opts(use_proxy: bool = True) -> Dict[str, Any]:
     return opts
 
 
-# ============================================================
-# MIME TYPES — para mobile reconhecer vídeo/áudio
-# ============================================================
 MIME_MAP = {
     ".mp4": "video/mp4",
     ".webm": "video/webm",
@@ -264,21 +260,31 @@ def get_mime_type(filename: str) -> str:
     return MIME_MAP.get(ext) or mimetypes.guess_type(filename)[0] or "application/octet-stream"
 
 
+def cleanup_previews(max_age_hours: int = 1):
+    """Remove previews antigos."""
+    try:
+        now = time.time()
+        for f in os.listdir(PREVIEW_DIR):
+            path = os.path.join(PREVIEW_DIR, f)
+            if os.path.isfile(path) and (now - os.path.getmtime(path)) > max_age_hours * 3600:
+                os.remove(path)
+    except Exception:
+        pass
+
+
 # ============================================================
-# ANALISAR (com cache + proxy seletivo)
+# ANALISAR
 # ============================================================
 @app.post("/api/analyze")
 async def analyze(req: AnalyzeRequest):
     url = req.url.strip()
     logger.info(f"Analisando: {url}")
 
-    # Cache hit?
     cached = analyze_cache.get(url)
     if cached and (time.time() - cached["ts"]) < CACHE_TTL:
         logger.info(f"✅ Cache hit: {url}")
         return cached["data"]
 
-    # ✅ Decide proxy por domínio
     use_proxy = needs_proxy(url) and bool(PROXY_URL)
     logger.info(f"Proxy: {'SIM' if use_proxy else 'NÃO'} ({urlparse(url).hostname})")
 
@@ -300,7 +306,6 @@ async def analyze(req: AnalyzeRequest):
             "platform": info.get("extractor_key", "Web"),
         }
 
-        # Salva no cache
         analyze_cache[url] = {"ts": time.time(), "data": result}
         if len(analyze_cache) > 200:
             oldest = sorted(analyze_cache.items(), key=lambda x: x[1]["ts"])[:50]
@@ -312,6 +317,99 @@ async def analyze(req: AnalyzeRequest):
     except Exception as e:
         logger.error(f"Erro analyze: {e}")
         raise HTTPException(status_code=400, detail=str(e))
+
+
+# ============================================================
+# PRÉ-VISUALIZAÇÃO (novo)
+# ============================================================
+def run_preview(preview_id: str, url: str):
+    """Baixa a pior qualidade do vídeo (rápido) para preview."""
+    outtmpl = os.path.join(PREVIEW_DIR, f"{preview_id}.%(ext)s")
+    use_proxy = needs_proxy(url) and bool(PROXY_URL)
+
+    opts = base_opts(use_proxy=use_proxy)
+    opts.update({
+        "outtmpl": outtmpl,
+        # Pior qualidade = download rápido e pequeno
+        "format": "worst[ext=mp4]/worst[height<=360]/worst",
+        # Sem áudio (mais rápido ainda)
+        "postprocessors": [],
+    })
+
+    previews_state[preview_id]["status"] = "downloading"
+
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([url])
+
+        files = [
+            f for f in os.listdir(PREVIEW_DIR)
+            if f.startswith(preview_id) and not f.endswith((".part", ".temp", ".ytdl"))
+        ]
+        if not files:
+            raise FileNotFoundError("Preview não encontrado")
+
+        path = os.path.join(PREVIEW_DIR, files[0])
+        previews_state[preview_id]["path"] = path
+        previews_state[preview_id]["status"] = "ready"
+        logger.info(f"[preview {preview_id}] OK: {path}")
+
+    except Exception as e:
+        logger.error(f"[preview {preview_id}] Erro: {e}")
+        previews_state[preview_id]["status"] = "error"
+        previews_state[preview_id]["message"] = str(e)
+
+
+@app.post("/api/preview")
+async def start_preview(req: PreviewRequest):
+    url = req.url.strip()
+    preview_id = str(uuid.uuid4())
+
+    # Limpa previews antigos (evita encher disco)
+    cleanup_previews(max_age_hours=1)
+
+    with state_lock:
+        previews_state[preview_id] = {"status": "queued", "path": None, "url": url}
+
+    logger.info(f"[preview {preview_id}] Iniciado: {url}")
+    asyncio.create_task(asyncio.to_thread(run_preview, preview_id, url))
+
+    return {"preview_id": preview_id, "status": "queued"}
+
+
+@app.get("/api/preview-status/{preview_id}")
+async def preview_status(preview_id: str):
+    with state_lock:
+        state = previews_state.get(preview_id)
+    if not state:
+        raise HTTPException(status_code=404, detail="Preview não encontrado")
+    return {
+        "status": state["status"],
+        "ready": state.get("path") is not None,
+        "message": state.get("message", ""),
+    }
+
+
+@app.get("/api/preview-file/{preview_id}")
+async def preview_file(preview_id: str):
+    with state_lock:
+        state = previews_state.get(preview_id)
+    if not state or not state.get("path"):
+        raise HTTPException(status_code=404, detail="Preview não disponível")
+
+    path = state["path"]
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Arquivo de preview não encontrado")
+
+    return FileResponse(
+        path=path,
+        media_type=get_mime_type(path),
+        headers={
+            "Content-Disposition": "inline",
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "private, max-age=3600",
+        },
+    )
 
 
 # ============================================================
@@ -353,16 +451,25 @@ def run_download(task_id: str, url: str, req: DownloadRequest, loop, use_proxy: 
         o.update({"outtmpl": outtmpl, "progress_hooks": [hook]})
 
         if req.format == "audio":
-            bitrate = req.quality.replace("audio-", "") if "audio-" in req.quality else "192"
-            o["format"] = "ba/b/bestaudio/best"
-            o["postprocessors"] = [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": bitrate,
-            }]
+            # 🆕 Modo rápido: mantém formato original (m4a/opus) sem reencoding
+            if req.quality == "audio-original":
+                o["format"] = "ba[ext=m4a]/ba[ext=opus]/ba[ext=webm]/ba/b"
+                # Sem postprocessors = MUITO mais rápido
+                logger.info(f"[{task_id}] Áudio ORIGINAL (sem conversão)")
+
+            else:
+                # Modo normal: converte para MP3
+                bitrate = req.quality.replace("audio-", "") if "audio-" in req.quality else "192"
+                o["format"] = "ba/b/bestaudio/best"
+                o["postprocessors"] = [{
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": bitrate,
+                }]
+                logger.info(f"[{task_id}] Áudio MP3 {bitrate}kbps")
+
         else:
             if req.quality == "best":
-                # Prioriza combinado (1 download, sem merge)
                 o["format"] = (
                     "b[ext=mp4]/b"
                     "/bv*+ba/bestvideo+bestaudio"
@@ -385,14 +492,13 @@ def run_download(task_id: str, url: str, req: DownloadRequest, loop, use_proxy: 
             ydl.download([url])
 
     except Exception as e:
-        # ✅ Fallback: se falhou SEM proxy e temos proxy, tenta COM proxy
         if not use_proxy and PROXY_URL:
             logger.warning(f"[{task_id}] Falhou sem proxy, tentando com proxy...")
             try:
                 with yt_dlp.YoutubeDL(build_opts(True)) as ydl:
                     ydl.download([url])
             except Exception as e2:
-                logger.error(f"[{task_id}] Erro final (com proxy): {e2}", exc_info=True)
+                logger.error(f"[{task_id}] Erro final: {e2}", exc_info=True)
                 emit({"status": "error", "percent": 0, "message": str(e2)})
                 return
         else:
@@ -400,7 +506,6 @@ def run_download(task_id: str, url: str, req: DownloadRequest, loop, use_proxy: 
             emit({"status": "error", "percent": 0, "message": str(e)})
             return
 
-    # Sucesso
     try:
         files = [
             f for f in os.listdir(DOWNLOAD_DIR)
@@ -430,7 +535,6 @@ async def start_download(req: DownloadRequest):
     url = req.url.strip()
     task_id = str(uuid.uuid4())
 
-    # ✅ Decide proxy por domínio
     use_proxy = needs_proxy(url) and bool(PROXY_URL)
     logger.info(
         f"[{task_id}] Iniciado: {url} | "
@@ -488,9 +592,6 @@ async def ws_progress(websocket: WebSocket, task_id: str):
             connections.pop(task_id, None)
 
 
-# ============================================================
-# DOWNLOAD DO ARQUIVO — compatível com mobile
-# ============================================================
 @app.get("/api/download-file/{task_id}")
 async def download_file(task_id: str, inline: bool = False):
     with state_lock:
@@ -502,13 +603,8 @@ async def download_file(task_id: str, inline: bool = False):
     if not path or not os.path.exists(path):
         raise HTTPException(status_code=404, detail="Arquivo indisponível")
 
-    # Nome limpo (sem prefixo task_id)
     clean_name = os.path.basename(path).replace(f"{task_id}_", "", 1)
-
-    # ✅ MIME type correto — crucial para mobile reconhecer como vídeo/áudio
     media_type = get_mime_type(clean_name)
-
-    # attachment = força download | inline = abre no player
     disposition = "inline" if inline else "attachment"
 
     return FileResponse(
@@ -517,20 +613,14 @@ async def download_file(task_id: str, inline: bool = False):
         media_type=media_type,
         headers={
             "Content-Disposition": f'{disposition}; filename="{clean_name}"',
-            # CORS: permite o frontend ler o nome do arquivo
             "Access-Control-Expose-Headers": "Content-Disposition, Content-Length",
-            # Cache leve
             "Cache-Control": "private, max-age=3600",
         },
     )
 
 
-# ============================================================
-# ENDPOINT EXTRA — checar se URL precisa de proxy
-# ============================================================
 @app.post("/api/check-proxy")
 async def check_proxy(req: AnalyzeRequest):
-    """Informa se essa URL vai usar proxy ou não."""
     url = req.url.strip()
     use = needs_proxy(url)
     return {
