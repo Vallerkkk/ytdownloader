@@ -23,7 +23,7 @@ IS_SERVER = os.environ.get("RENDER", "").lower() == "true" or os.environ.get("PO
 HOST = "0.0.0.0" if IS_SERVER else "127.0.0.1"
 PORT = int(os.environ.get("PORT", "8000"))
 
-PROXY_URL = os.environ.get("PROXY_URL")  # opcional
+PROXY_URL = os.environ.get("PROXY_URL")
 
 
 # ============================================================
@@ -47,18 +47,30 @@ INDEX_FILE = os.path.join(BASE_DIR, "index.html")
 
 
 # ============================================================
-# COOKIES
+# COOKIES — copia para /tmp/ (gravável) porque /etc/secrets é read-only
 # ============================================================
 COOKIES_FILE = None
-for candidate in ("/etc/secrets/cookies.txt", os.path.join(BASE_DIR, "cookies.txt")):
-    if os.path.exists(candidate):
-        COOKIES_FILE = candidate
-        break
+_candidates = ["/etc/secrets/cookies.txt", os.path.join(BASE_DIR, "cookies.txt")]
+_source = next((c for c in _candidates if os.path.exists(c)), None)
 
-if COOKIES_FILE:
-    logger.info(f"✅ Cookies: {COOKIES_FILE}")
+if _source:
+    try:
+        if _source.startswith("/etc/secrets"):
+            _tmp = "/tmp/cookies.txt"
+            with open(_source, "rb") as fsrc:
+                data = fsrc.read()
+            with open(_tmp, "wb") as fdst:
+                fdst.write(data)
+            COOKIES_FILE = _tmp
+            logger.info(f"✅ Cookies copiados: {_source} → {_tmp}")
+        else:
+            COOKIES_FILE = _source
+            logger.info(f"✅ Cookies: {_source}")
+    except Exception as e:
+        logger.warning(f"⚠️  Erro ao preparar cookies: {e}")
+        COOKIES_FILE = None
 else:
-    logger.warning("⚠️  cookies.txt NÃO encontrado")
+    logger.info("ℹ️  Nenhum cookies.txt — rodando só com proxy")
 
 
 # ============================================================
@@ -83,9 +95,9 @@ def find_deno() -> Optional[str]:
     deno = shutil.which("deno")
     if deno:
         logger.info(f"✅ Deno: {deno}")
-        deno_dir = os.path.dirname(deno)
-        if deno_dir not in os.environ.get("PATH", ""):
-            os.environ["PATH"] = deno_dir + os.pathsep + os.environ.get("PATH", "")
+        d = os.path.dirname(deno)
+        if d not in os.environ.get("PATH", ""):
+            os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
         return deno
     logger.warning("⚠️  Deno não encontrado")
     return None
@@ -177,9 +189,10 @@ def base_opts() -> Dict[str, Any]:
         opts["proxy"] = PROXY_URL
         logger.info("Usando proxy")
 
+    # Tenta vários clients do YouTube — um deles sempre libera
     opts["extractor_args"] = {
         "youtube": {
-            "player_client": ["web", "web_safari"],
+            "player_client": ["web_safari", "web", "android", "ios", "tv"],
         },
     }
     return opts
@@ -195,6 +208,8 @@ async def analyze(req: AnalyzeRequest):
 
     opts = base_opts()
     opts["extract_flat"] = False
+    # Não filtra formato — só queremos metadados
+    opts["format"] = None
 
     def _run():
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -253,23 +268,40 @@ def run_download(task_id: str, url: str, req: DownloadRequest, loop):
 
     if req.format == "audio":
         bitrate = req.quality.replace("audio-", "") if "audio-" in req.quality else "192"
-        opts["format"] = "ba/b"
+        opts["format"] = "ba/b/bestaudio/best"
         opts["postprocessors"] = [{
             "key": "FFmpegExtractAudio",
             "preferredcodec": "mp3",
             "preferredquality": bitrate,
         }]
     else:
-        opts["format"] = "bv*+ba/b" if req.quality == "best" \
-            else f"bv*[height<={req.quality}]+ba/b[height<={req.quality}]/b"
+        if req.quality == "best":
+            # Cascata ampla: tenta ideal → combinado → best → worst (último recurso)
+            opts["format"] = (
+                "bv*+ba/b"
+                "/bestvideo+bestaudio"
+                "/best"
+                "/worst"
+            )
+        else:
+            q = req.quality
+            opts["format"] = (
+                f"bv*[height<={q}]+ba/b[height<={q}]"
+                f"/b[height<={q}]"
+                f"/best[height<={q}]"
+                f"/b"
+                f"/worst"
+            )
         opts["merge_output_format"] = "mp4"
 
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.download([url])
 
-        files = [f for f in os.listdir(DOWNLOAD_DIR)
-                 if f.startswith(task_id) and not f.endswith((".part", ".temp", ".ytdl"))]
+        files = [
+            f for f in os.listdir(DOWNLOAD_DIR)
+            if f.startswith(task_id) and not f.endswith((".part", ".temp", ".ytdl"))
+        ]
         if not files:
             raise FileNotFoundError("Arquivo não encontrado após download.")
 
