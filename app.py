@@ -23,6 +23,8 @@ IS_SERVER = os.environ.get("RENDER", "").lower() == "true" or os.environ.get("PO
 HOST = "0.0.0.0" if IS_SERVER else "127.0.0.1"
 PORT = int(os.environ.get("PORT", "8000"))
 
+PROXY_URL = os.environ.get("PROXY_URL")  # opcional
+
 
 # ============================================================
 # LOG
@@ -39,17 +41,13 @@ logger = logging.getLogger(__name__)
 # CAMINHOS
 # ============================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
 DOWNLOAD_DIR = os.path.join(BASE_DIR, "downloads")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-
 INDEX_FILE = os.path.join(BASE_DIR, "index.html")
 
 
 # ============================================================
-# COOKIES — procura em ordem:
-#   1. /etc/secrets/cookies.txt  (Render Secret File)
-#   2. ./cookies.txt             (local / mesma pasta)
+# COOKIES
 # ============================================================
 COOKIES_FILE = None
 for candidate in ("/etc/secrets/cookies.txt", os.path.join(BASE_DIR, "cookies.txt")):
@@ -60,7 +58,7 @@ for candidate in ("/etc/secrets/cookies.txt", os.path.join(BASE_DIR, "cookies.tx
 if COOKIES_FILE:
     logger.info(f"✅ Cookies: {COOKIES_FILE}")
 else:
-    logger.warning("⚠️  cookies.txt NÃO encontrado — YouTube vai falhar")
+    logger.warning("⚠️  cookies.txt NÃO encontrado")
 
 
 # ============================================================
@@ -79,18 +77,17 @@ FFMPEG_LOCATION = find_ffmpeg()
 
 
 # ============================================================
-# DENO (JS runtime para challenges do YouTube)
+# DENO
 # ============================================================
 def find_deno() -> Optional[str]:
     deno = shutil.which("deno")
     if deno:
         logger.info(f"✅ Deno: {deno}")
-        # Garante que está no PATH do processo atual (para yt-dlp achar)
         deno_dir = os.path.dirname(deno)
         if deno_dir not in os.environ.get("PATH", ""):
             os.environ["PATH"] = deno_dir + os.pathsep + os.environ.get("PATH", "")
         return deno
-    logger.warning("⚠️  Deno não encontrado — YouTube pode falhar com challenges JS")
+    logger.warning("⚠️  Deno não encontrado")
     return None
 
 
@@ -98,7 +95,7 @@ DENO_PATH = find_deno()
 
 
 # ============================================================
-# APP FASTAPI
+# APP
 # ============================================================
 app = FastAPI(title="NeonVD API", version="2.0.0")
 
@@ -125,6 +122,7 @@ async def health():
         "ffmpeg": bool(FFMPEG_LOCATION),
         "deno": bool(DENO_PATH),
         "cookies": bool(COOKIES_FILE),
+        "proxy": bool(PROXY_URL),
         "server": IS_SERVER,
     }
 
@@ -173,17 +171,17 @@ def base_opts() -> Dict[str, Any]:
     }
     if FFMPEG_LOCATION:
         opts["ffmpeg_location"] = FFMPEG_LOCATION
-
     if COOKIES_FILE:
         opts["cookiefile"] = COOKIES_FILE
+    if PROXY_URL:
+        opts["proxy"] = PROXY_URL
+        logger.info("Usando proxy")
 
-    # Força clientes que funcionam bem com cookies + deno
     opts["extractor_args"] = {
         "youtube": {
             "player_client": ["web", "web_safari"],
         },
     }
-
     return opts
 
 
@@ -362,28 +360,9 @@ async def download_file(task_id: str):
 # ============================================================
 # START
 # ============================================================
-def open_browser(url: str):
-    import urllib.request
-    start = time.time()
-    while time.time() - start < 10:
-        try:
-            urllib.request.urlopen(url, timeout=1)
-            import webbrowser
-            webbrowser.open(url)
-            return
-        except Exception:
-            time.sleep(0.3)
-
-
 def main():
     import uvicorn
-
-    url = f"http://{HOST}:{PORT}"
-
-    if not IS_SERVER:
-        threading.Thread(target=open_browser, args=(url,), daemon=True).start()
-
-    logger.info(f"Servidor: {url}")
+    logger.info(f"Servidor: http://{HOST}:{PORT}")
     uvicorn.run(app, host=HOST, port=PORT, reload=False, log_level="info")
 
 
