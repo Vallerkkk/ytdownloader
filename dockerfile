@@ -1,13 +1,17 @@
 FROM python:3.12-slim
 
-# ---------- Sistema + ffmpeg + Deno ----------
+# ---------- Sistema + ffmpeg ----------
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg curl unzip ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-RUN curl -fsSL https://deno.land/install.sh | sh \
-    && ln -s /usr/local/bin/deno /usr/bin/deno
+# ---------- Deno (download direto do GitHub releases) ----------
+RUN curl -fsSL https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip -o /tmp/deno.zip \
+    && unzip /tmp/deno.zip -d /usr/local/bin/ \
+    && chmod +x /usr/local/bin/deno \
+    && rm /tmp/deno.zip
 
+# ---------- Verificação ----------
 RUN ffmpeg -version | head -1 && deno --version
 
 WORKDIR /app
