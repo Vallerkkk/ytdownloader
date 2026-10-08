@@ -8,6 +8,7 @@ import logging
 import threading
 import time
 from typing import Dict, Any, Optional
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -47,6 +48,29 @@ INDEX_FILE = os.path.join(BASE_DIR, "index.html")
 
 
 # ============================================================
+# PROXY SELETIVO — só usa proxy onde realmente precisa
+# ============================================================
+PROXY_REQUIRED_DOMAINS = (
+    "youtube.com",
+    "youtu.be",
+    "youtube-nocookie.com",
+    "music.youtube.com",
+    "m.youtube.com",
+)
+
+
+def needs_proxy(url: str) -> bool:
+    """Retorna True se a URL precisa passar pelo proxy."""
+    try:
+        host = (urlparse(url).hostname or "").lower()
+        if host.startswith("www."):
+            host = host[4:]
+        return any(host == d or host.endswith("." + d) for d in PROXY_REQUIRED_DOMAINS)
+    except Exception:
+        return False
+
+
+# ============================================================
 # COOKIES — copia para /tmp/ (gravável) porque /etc/secrets é read-only
 # ============================================================
 COOKIES_FILE = None
@@ -70,7 +94,7 @@ if _source:
         logger.warning(f"⚠️  Erro ao preparar cookies: {e}")
         COOKIES_FILE = None
 else:
-    logger.info("ℹ️  Nenhum cookies.txt — rodando só com proxy")
+    logger.info("ℹ️  Nenhum cookies.txt — rodando só com proxy (quando necessário)")
 
 
 # ============================================================
@@ -109,7 +133,7 @@ DENO_PATH = find_deno()
 # ============================================================
 # APP
 # ============================================================
-app = FastAPI(title="NeonVD API", version="2.1.0")
+app = FastAPI(title="NeonVD API", version="2.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -137,6 +161,7 @@ async def health():
         "proxy": bool(PROXY_URL),
         "server": IS_SERVER,
         "cache_size": len(analyze_cache),
+        "proxy_required_domains": list(PROXY_REQUIRED_DOMAINS),
     }
 
 
@@ -177,7 +202,7 @@ def clean_ansi(t: str) -> str:
     return ANSI_RE.sub("", str(t or "")).strip()
 
 
-def base_opts() -> Dict[str, Any]:
+def base_opts(use_proxy: bool = True) -> Dict[str, Any]:
     opts: Dict[str, Any] = {
         # ---------- Básico ----------
         "quiet": True,
@@ -186,19 +211,13 @@ def base_opts() -> Dict[str, Any]:
         "noplaylist": True,
 
         # ---------- PERFORMANCE ----------
-        # 8 fragmentos em paralelo (3–8x mais rápido em vídeos longos)
         "concurrent_fragment_downloads": 8,
-        # Chunks de 10 MB (reduz overhead de requisições)
         "http_chunk_size": 10 * 1024 * 1024,
-        # Buffer maior
         "buffersize": 1024 * 1024,
-        # Retries robustos (não acelera, mas evita travar)
         "retries": 10,
         "fragment_retries": 10,
         "file_access_retries": 5,
-        # Permite retomar downloads interrompidos
         "continuedl": True,
-        # Não redimensiona o buffer durante download
         "noresizebuffer": False,
     }
 
@@ -206,7 +225,9 @@ def base_opts() -> Dict[str, Any]:
         opts["ffmpeg_location"] = FFMPEG_LOCATION
     if COOKIES_FILE:
         opts["cookiefile"] = COOKIES_FILE
-    if PROXY_URL:
+
+    # ✅ Proxy seletivo
+    if use_proxy and PROXY_URL:
         opts["proxy"] = PROXY_URL
 
     # Multi-cliente do YouTube (um sempre libera)
@@ -219,7 +240,7 @@ def base_opts() -> Dict[str, Any]:
 
 
 # ============================================================
-# ANALISAR (com cache)
+# ANALISAR (com cache + proxy seletivo)
 # ============================================================
 @app.post("/api/analyze")
 async def analyze(req: AnalyzeRequest):
@@ -232,7 +253,11 @@ async def analyze(req: AnalyzeRequest):
         logger.info(f"✅ Cache hit: {url}")
         return cached["data"]
 
-    opts = base_opts()
+    # ✅ Decide proxy por domínio
+    use_proxy = needs_proxy(url) and bool(PROXY_URL)
+    logger.info(f"Proxy: {'SIM' if use_proxy else 'NÃO'} ({urlparse(url).hostname})")
+
+    opts = base_opts(use_proxy=use_proxy)
     opts["extract_flat"] = False
     opts["format"] = None
 
@@ -252,7 +277,6 @@ async def analyze(req: AnalyzeRequest):
 
         # Salva no cache
         analyze_cache[url] = {"ts": time.time(), "data": result}
-        # Limita tamanho do cache
         if len(analyze_cache) > 200:
             oldest = sorted(analyze_cache.items(), key=lambda x: x[1]["ts"])[:50]
             for k, _ in oldest:
@@ -266,9 +290,9 @@ async def analyze(req: AnalyzeRequest):
 
 
 # ============================================================
-# DOWNLOAD
+# DOWNLOAD — worker em thread
 # ============================================================
-def run_download(task_id: str, url: str, req: DownloadRequest, loop):
+def run_download(task_id: str, url: str, req: DownloadRequest, loop, use_proxy: bool = True):
     outtmpl = os.path.join(DOWNLOAD_DIR, f"{task_id}_%(title).100B.%(ext)s")
 
     def emit(data: dict):
@@ -299,45 +323,60 @@ def run_download(task_id: str, url: str, req: DownloadRequest, loop):
         elif d.get("status") == "finished":
             emit({"status": "processing", "percent": 99, "message": "Processando..."})
 
-    opts = base_opts()
-    opts.update({"outtmpl": outtmpl, "progress_hooks": [hook]})
+    def build_opts(use_proxy_inner: bool):
+        o = base_opts(use_proxy=use_proxy_inner)
+        o.update({"outtmpl": outtmpl, "progress_hooks": [hook]})
 
-    if req.format == "audio":
-        bitrate = req.quality.replace("audio-", "") if "audio-" in req.quality else "192"
-        opts["format"] = "ba/b/bestaudio/best"
-        opts["postprocessors"] = [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-            "preferredquality": bitrate,
-        }]
-    else:
-        if req.quality == "best":
-            # Prioriza stream COMBINADO (1 download, sem merge)
-            # → economiza banda de proxy (~40%) e tempo (~50%)
-            opts["format"] = (
-                "b[ext=mp4]"              # 1º: combinado mp4
-                "/b"                       # 2º: qualquer combinado
-                "/bv*+ba"                 # 3º: separado (com merge)
-                "/bestvideo+bestaudio"
-                "/best"
-                "/worst"
-            )
+        if req.format == "audio":
+            bitrate = req.quality.replace("audio-", "") if "audio-" in req.quality else "192"
+            o["format"] = "ba/b/bestaudio/best"
+            o["postprocessors"] = [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": bitrate,
+            }]
         else:
-            q = req.quality
-            opts["format"] = (
-                f"b[ext=mp4][height<={q}]"
-                f"/b[height<={q}]"
-                f"/bv*[height<={q}]+ba/b[height<={q}]"
-                f"/best[height<={q}]"
-                f"/b"
-                f"/worst"
-            )
-        opts["merge_output_format"] = "mp4"
+            if req.quality == "best":
+                # Prioriza combinado (1 download, sem merge)
+                o["format"] = (
+                    "b[ext=mp4]/b"
+                    "/bv*+ba/bestvideo+bestaudio"
+                    "/best/worst"
+                )
+            else:
+                q = req.quality
+                o["format"] = (
+                    f"b[ext=mp4][height<={q}]"
+                    f"/b[height<={q}]"
+                    f"/bv*[height<={q}]+ba/b[height<={q}]"
+                    f"/best[height<={q}]"
+                    f"/b/worst"
+                )
+            o["merge_output_format"] = "mp4"
+        return o
 
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
+        with yt_dlp.YoutubeDL(build_opts(use_proxy)) as ydl:
             ydl.download([url])
 
+    except Exception as e:
+        # ✅ Fallback: se falhou SEM proxy e temos proxy, tenta COM proxy
+        if not use_proxy and PROXY_URL:
+            logger.warning(f"[{task_id}] Falhou sem proxy, tentando com proxy...")
+            try:
+                with yt_dlp.YoutubeDL(build_opts(True)) as ydl:
+                    ydl.download([url])
+            except Exception as e2:
+                logger.error(f"[{task_id}] Erro final (com proxy): {e2}", exc_info=True)
+                emit({"status": "error", "percent": 0, "message": str(e2)})
+                return
+        else:
+            logger.error(f"[{task_id}] Erro: {e}", exc_info=True)
+            emit({"status": "error", "percent": 0, "message": str(e)})
+            return
+
+    # Sucesso
+    try:
         files = [
             f for f in os.listdir(DOWNLOAD_DIR)
             if f.startswith(task_id) and not f.endswith((".part", ".temp", ".ytdl"))
@@ -357,7 +396,7 @@ def run_download(task_id: str, url: str, req: DownloadRequest, loop):
         logger.info(f"[{task_id}] OK: {path}")
 
     except Exception as e:
-        logger.error(f"[{task_id}] Erro: {e}", exc_info=True)
+        logger.error(f"[{task_id}] Erro pós-download: {e}", exc_info=True)
         emit({"status": "error", "percent": 0, "message": str(e)})
 
 
@@ -366,17 +405,30 @@ async def start_download(req: DownloadRequest):
     url = req.url.strip()
     task_id = str(uuid.uuid4())
 
+    # ✅ Decide proxy por domínio
+    use_proxy = needs_proxy(url) and bool(PROXY_URL)
+    logger.info(
+        f"[{task_id}] Iniciado: {url} | "
+        f"proxy={'SIM' if use_proxy else 'NÃO'} ({urlparse(url).hostname})"
+    )
+
     with state_lock:
         tasks_state[task_id] = {
             "status": "queued", "percent": 0, "speed": "--",
             "eta": "--", "file_path": None, "message": "Na fila...",
+            "using_proxy": use_proxy,
         }
 
     loop = asyncio.get_running_loop()
-    asyncio.create_task(asyncio.to_thread(run_download, task_id, url, req, loop))
+    asyncio.create_task(
+        asyncio.to_thread(run_download, task_id, url, req, loop, use_proxy)
+    )
 
-    logger.info(f"[{task_id}] Iniciado: {url}")
-    return {"task_id": task_id, "message": "Download iniciado"}
+    return {
+        "task_id": task_id,
+        "message": "Download iniciado",
+        "using_proxy": use_proxy,
+    }
 
 
 @app.get("/api/progress/{task_id}")
@@ -427,6 +479,25 @@ async def download_file(task_id: str):
         filename=os.path.basename(path).replace(f"{task_id}_", "", 1),
         media_type="application/octet-stream",
     )
+
+
+# ============================================================
+# ENDPOINT EXTRA — checar se URL precisa de proxy
+# ============================================================
+@app.post("/api/check-proxy")
+async def check_proxy(req: AnalyzeRequest):
+    """Informa se essa URL vai usar proxy ou não."""
+    url = req.url.strip()
+    use = needs_proxy(url)
+    return {
+        "url": url,
+        "uses_proxy": use,
+        "reason": (
+            "YouTube bloqueia IPs de datacenter — proxy é necessário"
+            if use else
+            "Site funciona sem proxy — mais rápido e sem custo"
+        ),
+    }
 
 
 # ============================================================
