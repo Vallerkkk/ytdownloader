@@ -7,6 +7,7 @@ import shutil
 import logging
 import threading
 import time
+import mimetypes
 from typing import Dict, Any, Optional
 from urllib.parse import urlparse
 
@@ -133,7 +134,7 @@ DENO_PATH = find_deno()
 # ============================================================
 # APP
 # ============================================================
-app = FastAPI(title="NeonVD API", version="2.2.0")
+app = FastAPI(title="NeonVD API", version="2.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -237,6 +238,30 @@ def base_opts(use_proxy: bool = True) -> Dict[str, Any]:
         },
     }
     return opts
+
+
+# ============================================================
+# MIME TYPES — para mobile reconhecer vídeo/áudio
+# ============================================================
+MIME_MAP = {
+    ".mp4": "video/mp4",
+    ".webm": "video/webm",
+    ".mkv": "video/x-matroska",
+    ".mov": "video/quicktime",
+    ".m4v": "video/x-m4v",
+    ".avi": "video/x-msvideo",
+    ".mp3": "audio/mpeg",
+    ".m4a": "audio/mp4",
+    ".opus": "audio/opus",
+    ".ogg": "audio/ogg",
+    ".wav": "audio/wav",
+    ".flac": "audio/flac",
+}
+
+
+def get_mime_type(filename: str) -> str:
+    ext = os.path.splitext(filename)[1].lower()
+    return MIME_MAP.get(ext) or mimetypes.guess_type(filename)[0] or "application/octet-stream"
 
 
 # ============================================================
@@ -463,8 +488,11 @@ async def ws_progress(websocket: WebSocket, task_id: str):
             connections.pop(task_id, None)
 
 
+# ============================================================
+# DOWNLOAD DO ARQUIVO — compatível com mobile
+# ============================================================
 @app.get("/api/download-file/{task_id}")
-async def download_file(task_id: str):
+async def download_file(task_id: str, inline: bool = False):
     with state_lock:
         state = tasks_state.get(task_id)
         path = state.get("file_path") if state else None
@@ -474,10 +502,26 @@ async def download_file(task_id: str):
     if not path or not os.path.exists(path):
         raise HTTPException(status_code=404, detail="Arquivo indisponível")
 
+    # Nome limpo (sem prefixo task_id)
+    clean_name = os.path.basename(path).replace(f"{task_id}_", "", 1)
+
+    # ✅ MIME type correto — crucial para mobile reconhecer como vídeo/áudio
+    media_type = get_mime_type(clean_name)
+
+    # attachment = força download | inline = abre no player
+    disposition = "inline" if inline else "attachment"
+
     return FileResponse(
         path=path,
-        filename=os.path.basename(path).replace(f"{task_id}_", "", 1),
-        media_type="application/octet-stream",
+        filename=clean_name,
+        media_type=media_type,
+        headers={
+            "Content-Disposition": f'{disposition}; filename="{clean_name}"',
+            # CORS: permite o frontend ler o nome do arquivo
+            "Access-Control-Expose-Headers": "Content-Disposition, Content-Length",
+            # Cache leve
+            "Cache-Control": "private, max-age=3600",
+        },
     )
 
 
