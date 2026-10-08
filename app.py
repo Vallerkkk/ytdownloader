@@ -19,7 +19,7 @@ import yt_dlp
 # ============================================================
 # AMBIENTE
 # ============================================================
-IS_SERVER = os.environ.get("RENDER", "") == "true" or os.environ.get("PORT") is not None
+IS_SERVER = os.environ.get("RENDER", "").lower() == "true" or os.environ.get("PORT") is not None
 HOST = "0.0.0.0" if IS_SERVER else "127.0.0.1"
 PORT = int(os.environ.get("PORT", "8000"))
 
@@ -40,29 +40,27 @@ logger = logging.getLogger(__name__)
 # ============================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Pasta de downloads
 DOWNLOAD_DIR = os.path.join(BASE_DIR, "downloads")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# Frontend
 INDEX_FILE = os.path.join(BASE_DIR, "index.html")
 
-# Cookies (na mesma pasta do app.py)
-# Procura em ordem: mesma pasta -> /etc/secrets/ (Render Secret File)
-COOKIES_FILE = os.path.join(BASE_DIR, "cookies.txt")
-if not os.path.exists(COOKIES_FILE):
-    render_cookies = "/etc/secrets/cookies.txt"
-    if os.path.exists(render_cookies):
-        COOKIES_FILE = render_cookies
 
-if os.path.exists(COOKIES_FILE):
-    logger.info(f"✅ Cookies encontrados: {COOKIES_FILE}")
+# ============================================================
+# COOKIES — procura em ordem:
+#   1. /etc/secrets/cookies.txt  (Render Secret File)
+#   2. ./cookies.txt             (local / mesma pasta)
+# ============================================================
+COOKIES_FILE = None
+for candidate in ("/etc/secrets/cookies.txt", os.path.join(BASE_DIR, "cookies.txt")):
+    if os.path.exists(candidate):
+        COOKIES_FILE = candidate
+        break
+
+if COOKIES_FILE:
+    logger.info(f"✅ Cookies: {COOKIES_FILE}")
 else:
-    logger.warning(
-        "⚠️  cookies.txt NÃO encontrado. "
-        "YouTube vai falhar com 'Sign in to confirm you're not a bot'. "
-        "Exporte seus cookies e salve como cookies.txt na pasta do app.py."
-    )
+    logger.warning("⚠️  cookies.txt NÃO encontrado — YouTube vai falhar")
 
 
 # ============================================================
@@ -71,9 +69,9 @@ else:
 def find_ffmpeg() -> Optional[str]:
     ff = shutil.which("ffmpeg")
     if ff:
-        logger.info(f"✅ ffmpeg encontrado: {ff}")
+        logger.info(f"✅ ffmpeg: {ff}")
         return os.path.dirname(ff)
-    logger.warning("⚠️  ffmpeg não encontrado — merge de vídeo+áudio vai falhar")
+    logger.warning("⚠️  ffmpeg não encontrado")
     return None
 
 
@@ -81,7 +79,26 @@ FFMPEG_LOCATION = find_ffmpeg()
 
 
 # ============================================================
-# APP
+# DENO (JS runtime para challenges do YouTube)
+# ============================================================
+def find_deno() -> Optional[str]:
+    deno = shutil.which("deno")
+    if deno:
+        logger.info(f"✅ Deno: {deno}")
+        # Garante que está no PATH do processo atual (para yt-dlp achar)
+        deno_dir = os.path.dirname(deno)
+        if deno_dir not in os.environ.get("PATH", ""):
+            os.environ["PATH"] = deno_dir + os.pathsep + os.environ.get("PATH", "")
+        return deno
+    logger.warning("⚠️  Deno não encontrado — YouTube pode falhar com challenges JS")
+    return None
+
+
+DENO_PATH = find_deno()
+
+
+# ============================================================
+# APP FASTAPI
 # ============================================================
 app = FastAPI(title="NeonVD API", version="2.0.0")
 
@@ -106,7 +123,9 @@ async def health():
     return {
         "status": "ok",
         "ffmpeg": bool(FFMPEG_LOCATION),
-        "cookies": os.path.exists(COOKIES_FILE),
+        "deno": bool(DENO_PATH),
+        "cookies": bool(COOKIES_FILE),
+        "server": IS_SERVER,
     }
 
 
@@ -155,9 +174,15 @@ def base_opts() -> Dict[str, Any]:
     if FFMPEG_LOCATION:
         opts["ffmpeg_location"] = FFMPEG_LOCATION
 
-    # Cookies
-    if os.path.exists(COOKIES_FILE):
+    if COOKIES_FILE:
         opts["cookiefile"] = COOKIES_FILE
+
+    # Força clientes que funcionam bem com cookies + deno
+    opts["extractor_args"] = {
+        "youtube": {
+            "player_client": ["web", "web_safari"],
+        },
+    }
 
     return opts
 
@@ -355,11 +380,10 @@ def main():
 
     url = f"http://{HOST}:{PORT}"
 
-    # Só abre navegador em execução local (não em servidor)
     if not IS_SERVER:
         threading.Thread(target=open_browser, args=(url,), daemon=True).start()
 
-    logger.info(f"Servidor iniciando em {url}")
+    logger.info(f"Servidor: {url}")
     uvicorn.run(app, host=HOST, port=PORT, reload=False, log_level="info")
 
 
