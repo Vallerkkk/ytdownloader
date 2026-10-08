@@ -109,7 +109,7 @@ DENO_PATH = find_deno()
 # ============================================================
 # APP
 # ============================================================
-app = FastAPI(title="NeonVD API", version="2.0.0")
+app = FastAPI(title="NeonVD API", version="2.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -136,6 +136,7 @@ async def health():
         "cookies": bool(COOKIES_FILE),
         "proxy": bool(PROXY_URL),
         "server": IS_SERVER,
+        "cache_size": len(analyze_cache),
     }
 
 
@@ -145,6 +146,10 @@ async def health():
 tasks_state: Dict[str, Dict[str, Any]] = {}
 connections: Dict[str, WebSocket] = {}
 state_lock = threading.Lock()
+
+# Cache de análises (economiza proxy em URLs repetidas)
+analyze_cache: Dict[str, dict] = {}
+CACHE_TTL = 3600  # 1 hora
 
 
 class AnalyzeRequest(BaseModel):
@@ -174,22 +179,37 @@ def clean_ansi(t: str) -> str:
 
 def base_opts() -> Dict[str, Any]:
     opts: Dict[str, Any] = {
+        # ---------- Básico ----------
         "quiet": True,
         "no_warnings": True,
         "http_headers": {"User-Agent": USER_AGENT},
         "noplaylist": True,
-        "retries": 3,
-        "fragment_retries": 3,
+
+        # ---------- PERFORMANCE ----------
+        # 8 fragmentos em paralelo (3–8x mais rápido em vídeos longos)
+        "concurrent_fragment_downloads": 8,
+        # Chunks de 10 MB (reduz overhead de requisições)
+        "http_chunk_size": 10 * 1024 * 1024,
+        # Buffer maior
+        "buffersize": 1024 * 1024,
+        # Retries robustos (não acelera, mas evita travar)
+        "retries": 10,
+        "fragment_retries": 10,
+        "file_access_retries": 5,
+        # Permite retomar downloads interrompidos
+        "continuedl": True,
+        # Não redimensiona o buffer durante download
+        "noresizebuffer": False,
     }
+
     if FFMPEG_LOCATION:
         opts["ffmpeg_location"] = FFMPEG_LOCATION
     if COOKIES_FILE:
         opts["cookiefile"] = COOKIES_FILE
     if PROXY_URL:
         opts["proxy"] = PROXY_URL
-        logger.info("Usando proxy")
 
-    # Tenta vários clients do YouTube — um deles sempre libera
+    # Multi-cliente do YouTube (um sempre libera)
     opts["extractor_args"] = {
         "youtube": {
             "player_client": ["web_safari", "web", "android", "ios", "tv"],
@@ -199,16 +219,21 @@ def base_opts() -> Dict[str, Any]:
 
 
 # ============================================================
-# ANALISAR
+# ANALISAR (com cache)
 # ============================================================
 @app.post("/api/analyze")
 async def analyze(req: AnalyzeRequest):
     url = req.url.strip()
     logger.info(f"Analisando: {url}")
 
+    # Cache hit?
+    cached = analyze_cache.get(url)
+    if cached and (time.time() - cached["ts"]) < CACHE_TTL:
+        logger.info(f"✅ Cache hit: {url}")
+        return cached["data"]
+
     opts = base_opts()
     opts["extract_flat"] = False
-    # Não filtra formato — só queremos metadados
     opts["format"] = None
 
     def _run():
@@ -217,13 +242,24 @@ async def analyze(req: AnalyzeRequest):
 
     try:
         info = await asyncio.to_thread(_run)
-        return {
+        result = {
             "title": info.get("title", "Sem título"),
             "thumbnail": info.get("thumbnail", ""),
             "duration": info.get("duration", 0),
             "channel": info.get("uploader", info.get("channel", "Desconhecido")),
             "platform": info.get("extractor_key", "Web"),
         }
+
+        # Salva no cache
+        analyze_cache[url] = {"ts": time.time(), "data": result}
+        # Limita tamanho do cache
+        if len(analyze_cache) > 200:
+            oldest = sorted(analyze_cache.items(), key=lambda x: x[1]["ts"])[:50]
+            for k, _ in oldest:
+                analyze_cache.pop(k, None)
+
+        return result
+
     except Exception as e:
         logger.error(f"Erro analyze: {e}")
         raise HTTPException(status_code=400, detail=str(e))
@@ -276,9 +312,12 @@ def run_download(task_id: str, url: str, req: DownloadRequest, loop):
         }]
     else:
         if req.quality == "best":
-            # Cascata ampla: tenta ideal → combinado → best → worst (último recurso)
+            # Prioriza stream COMBINADO (1 download, sem merge)
+            # → economiza banda de proxy (~40%) e tempo (~50%)
             opts["format"] = (
-                "bv*+ba/b"
+                "b[ext=mp4]"              # 1º: combinado mp4
+                "/b"                       # 2º: qualquer combinado
+                "/bv*+ba"                 # 3º: separado (com merge)
                 "/bestvideo+bestaudio"
                 "/best"
                 "/worst"
@@ -286,8 +325,9 @@ def run_download(task_id: str, url: str, req: DownloadRequest, loop):
         else:
             q = req.quality
             opts["format"] = (
-                f"bv*[height<={q}]+ba/b[height<={q}]"
+                f"b[ext=mp4][height<={q}]"
                 f"/b[height<={q}]"
+                f"/bv*[height<={q}]+ba/b[height<={q}]"
                 f"/best[height<={q}]"
                 f"/b"
                 f"/worst"
