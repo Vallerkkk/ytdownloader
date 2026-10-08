@@ -288,11 +288,11 @@ member.op.gg	FALSE	/	TRUE	1795963483	_otr	eyJ0eXAiOiJydCtqd3QiLCJhbGciOiJSUzI1Ni
 .youtube.com	TRUE	/	FALSE	0	PREF	f6=40000080&f7=100&tz=UTC&hl=en
 .youtube.com	TRUE	/	TRUE	1807042902	__Secure-1PSIDTS	sidts-CjQBkldj_zvHL6cHH4bDsjkCrS14fR82QUlPimj0Nb3w8K7UkKCnSQ04Aaw30yPkusneWEc9EAA
 .youtube.com	TRUE	/	TRUE	1807042902	__Secure-3PSIDTS	sidts-CjQBkldj_zvHL6cHH4bDsjkCrS14fR82QUlPimj0Nb3w8K7UkKCnSQ04Aaw30yPkusneWEc9EAA
-.youtube.com	TRUE	/	FALSE	1823027662	SIDCC	AKEyXzVBMm0LDco0Z1NfTLPyC4ONmveugi3jxiYKjH7U5aLrI1ViGnT0nddQB2zDBMgU9rOy1Ws
-.youtube.com	TRUE	/	TRUE	1823027662	__Secure-1PSIDCC	AKEyXzXVM97qd9P8Csl7OC8Asd89XNMXAeYJwLGP9-K1b4xjJFdN4c4adOXU20tXmbzr0ssRqA
-.youtube.com	TRUE	/	TRUE	1823027662	__Secure-3PSIDCC	AKEyXzV4R3qF7i9qWbd4xoDyR_dpKni7mteL5iBa5GKaXLFq6of_doarq-a1dcmAsiHJUMrhPw
-.youtube.com	TRUE	/	TRUE	1807043662	VISITOR_INFO1_LIVE	c_j3TvALl1I
-.youtube.com	TRUE	/	TRUE	1807043662	VISITOR_PRIVACY_METADATA	CgJCUhIEGgAgKA%3D%3D
+.youtube.com	TRUE	/	FALSE	1823028135	SIDCC	AKEyXzVBzVVGCfZgQt-dFJjDIGTpi7jJFOJ2XNQosoVfkVYzeenS9PnsCGJtqXywYj28eumGu84
+.youtube.com	TRUE	/	TRUE	1823028135	__Secure-1PSIDCC	AKEyXzWn0BRHKGtgx4zOL4dekNIlKGmHCmlb6R8lxTeUdJJg69duSNQb3MN9hbR2U_DobOjmxw
+.youtube.com	TRUE	/	TRUE	1823028135	__Secure-3PSIDCC	AKEyXzWoqjBzVfhaTXDQiqbpuduVQDpgWNclSZ3wOJyjts_SBASzO0gqPrIfHB_yCFYyUfwz1Q
+.youtube.com	TRUE	/	TRUE	1807044135	VISITOR_INFO1_LIVE	c_j3TvALl1I
+.youtube.com	TRUE	/	TRUE	1807044135	VISITOR_PRIVACY_METADATA	CgJCUhIEGgAgKA%3D%3D
 .youtube.com	TRUE	/	TRUE	1806995693	__Secure-YNID	22.YT=K7VPQgltjf5JhW2MH5pp0cPRJB07O9ISZorAWmNVuJ7WbtD9C2SEu53KjHLMbe0uwNE0rXmYh_TdgC58IFVvmJaymWMdZF8HyHDGKGRIyiq9RNJvo3Y7nY0N96rf9Jt0HbOvLtwsk3nm88Hjh7uospPlcKokp5SY50AyAGz_ZVCjgxCPzgzaXYJ2zVVnJ-O6qc9ya1bJq43Pu1woJJjTZpGeudzXJDYQG1uDxbWTSbZwAbONIg1Aaz4tMVeVpRwHzg9HIVXnjfppzcQavqnws7App5HQtfgWOfmiHzAD28R5aEUNe3-gjiPtUoXsfzE57VslmbyIxBLIeUHbmOvtVw
 .youtube.com	TRUE	/	TRUE	0	YSC	EVcQPtJ_A8s
 .youtube.com	TRUE	/	TRUE	1806995693	__Secure-ROLLOUT_TOKEN	CKmGxeH1p5-b-gEQ-Yn1qtDclgMY4JLS6O-plwM%3D
@@ -651,7 +651,6 @@ login.microsoftonline.com	FALSE	/	TRUE	1794079685	fpc	AiRnIF9EecZDoROhloev2oWXMw
 login.live.com	FALSE	/	TRUE	1807039692	__Host-MSAAUTHP	11-M.C512_BAY.0.U.MsaArtifacts.CtvK9POSf0PB!wHJCpQsh!3So2zi4ghhBJf5izkws*6GLJ9qHYGpeIIsIX9aJ5Xhd93WdfZx3OfCGVeurbY6cyu0mYIqHBRICMBgcpq9XHpRhRjxEAyPSGYKieITjDu1TvqpqB0HYRcKFTBDnKc6vC440JQQeB!mfmbTIIi5q6CPP3mWvuumL3xKmJTpsT*bKAlhH1T5Dh52OWTi*JUWW10K1danqF*3yTAfcbCLx114lNB7brm5xIrIEu5EKYgO7m4p8OySkYm13mfIbYJVtIwhK!4ztO0u0G1ALNsHFKAOvvy5i8Mwe90Werfsp81iUmhXomrY5iRM4tdFMSohuB0$
 didactic-goggles-x6q5v5vpgj397gj.github.dev	FALSE	/	TRUE	1807042104	cs-workbench-type	codespaces
 didactic-goggles-x6q5v5vpgj397gj.github.dev	FALSE	/	TRUE	1807042104	cs-feature-flags	{"developer":false,"detailedActivityMonitor":false,"vscodeAccountSwitching":true,"enableSmbDiagnosticContinuousMonitoring":false,"enableSmbDiagnosticOnAnomalyMonitoring":false,"useEarlyWorkbenchWebClient":true,"useCoiWebClient":false,"remapUserNamespace":false,"removeConnectRetriesWebClient":true,"storageV2ExhaustiveValidation":false,"forcePushShutdownTelemetry":true,"useNewJupyterApi":true,"improvedWarmupContainerReuse":true,"storageV2ComprehensiveDiagnosticsCollection":false,"usingCopilotWorkspaceConfig":false,"copilotWorkspace":false,"hostnameSpecificGitCredentialHelper":true,"storageV2ForcedFlushes":false,"storageV2AdvancedFsLogs":false,"storageV2DisableIoUring":false,"storageV2DisableCifsPrefetch":true,"environmentChangesMonitorStopsWatcher":true,"storageV2AggressivePrefetch":false,"storageV2ExtremePrefetch":false,"workspaceTrust":true,"disableAutomaticTasks":true,"tunnelProxySupport":true}
-didactic-goggles-x6q5v5vpgj397gj.github.dev	FALSE	/	TRUE	1791491904	codespace.session_v2	djAxQRz698U09NEMMX9aSRMUSmqbsxvV6TSPCIlwWw3+9H4lysTvz2LdBg==
 didactic-goggles-x6q5v5vpgj397gj.github.dev	FALSE	/	TRUE	1807042104	cs-auth-attempts	0
 api.x.com	FALSE	/	FALSE	0	lang	en
 .store.epicgames.com	TRUE	/	TRUE	1804187294	cf_clearance	lu4yFaS2ietQyWs2X4hfAzVkTwImovHGPt2mv3tjsyo-1788635294-1.2.1.1-Mnwcn1SD9w23498fMhy3hzvxXYcAllfX6nyc6tdDg3FOlETx2dKCwrh5GHPbCGTpkkRguC7gRUqslXrGzsE6j8UJaoOZhdjTsBLAbd29IADVkcKQZYMT_tTCsq5OrBcXMM.ruQZldW6xo4p_KaMcoeObMKeNqnuCeyp1747oyKDuO.go8jzCvu3jFVqas42T_WR5Gcy_.3l6VXqF6THSPg0PePYnT55iupSnNka8We7176HgY8H5dmtWmVdaVmK9qH39cXhvhfQsRLT5WArvKXjxdLSXyQGOp8fYArix0KoMoZeABEqOC23sdfK12fbQxeQEx3zPJKXw8sFaUPdarI0QMyNBrbHR3UTUNOaevEM
