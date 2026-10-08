@@ -6,7 +6,6 @@ import uuid
 import shutil
 import logging
 import threading
-import webbrowser
 import time
 from typing import Dict, Any, Optional
 
@@ -18,31 +17,20 @@ import yt_dlp
 
 
 # ============================================================
-# CAMINHOS (funciona como .py e como .exe)
+# AMBIENTE
 # ============================================================
-def resource_path(rel: str) -> str:
-    if hasattr(sys, "_MEIPASS"):
-        return os.path.join(sys._MEIPASS, rel)
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), rel)
-
-
-def writable_path(rel: str) -> str:
-    base = os.path.dirname(sys.executable) if hasattr(sys, "_MEIPASS") \
-           else os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(base, rel)
+IS_SERVER = os.environ.get("RENDER", "") == "true" or os.environ.get("PORT") is not None
+HOST = "0.0.0.0" if IS_SERVER else "127.0.0.1"
+PORT = int(os.environ.get("PORT", "8000"))
 
 
 # ============================================================
 # LOG
 # ============================================================
-LOG_FILE = writable_path("neonvd.log")
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_FILE, encoding="utf-8"),
-        logging.StreamHandler(sys.stdout),
-    ],
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger(__name__)
 
@@ -51,26 +39,25 @@ logger = logging.getLogger(__name__)
 # FFMPEG
 # ============================================================
 def find_ffmpeg() -> Optional[str]:
-    for base in (resource_path("bin"), writable_path("bin")):
-        if os.path.isdir(base):
-            for n in ("ffmpeg.exe", "ffmpeg"):
-                if os.path.exists(os.path.join(base, n)):
-                    logger.info(f"ffmpeg: {base}")
-                    return base
-    sys_ffmpeg = shutil.which("ffmpeg")
-    if sys_ffmpeg:
-        logger.info(f"ffmpeg no PATH: {sys_ffmpeg}")
-        return os.path.dirname(sys_ffmpeg)
-    logger.warning("ffmpeg nao encontrado. Merge de video+audio vai falhar.")
+    ff = shutil.which("ffmpeg")
+    if ff:
+        logger.info(f"ffmpeg encontrado: {ff}")
+        return os.path.dirname(ff)
+    logger.warning("ffmpeg não encontrado")
     return None
 
 
 FFMPEG_LOCATION = find_ffmpeg()
 
-DOWNLOAD_DIR = writable_path("downloads")
+
+# ============================================================
+# DIRETÓRIOS
+# ============================================================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DOWNLOAD_DIR = os.path.join(BASE_DIR, "downloads")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-INDEX_FILE = resource_path("index.html")
+INDEX_FILE = os.path.join(BASE_DIR, "index.html")
 
 
 # ============================================================
@@ -90,7 +77,7 @@ app.add_middleware(
 @app.get("/", include_in_schema=False)
 async def serve_index():
     if not os.path.exists(INDEX_FILE):
-        raise HTTPException(status_code=404, detail="index.html nao encontrado.")
+        raise HTTPException(status_code=404, detail="index.html não encontrado.")
     return FileResponse(INDEX_FILE)
 
 
@@ -164,7 +151,7 @@ async def analyze(req: AnalyzeRequest):
     try:
         info = await asyncio.to_thread(_run)
         return {
-            "title": info.get("title", "Sem titulo"),
+            "title": info.get("title", "Sem título"),
             "thumbnail": info.get("thumbnail", ""),
             "duration": info.get("duration", 0),
             "channel": info.get("uploader", info.get("channel", "Desconhecido")),
@@ -176,7 +163,7 @@ async def analyze(req: AnalyzeRequest):
 
 
 # ============================================================
-# DOWNLOAD — worker em thread
+# DOWNLOAD
 # ============================================================
 def run_download(task_id: str, url: str, req: DownloadRequest, loop):
     outtmpl = os.path.join(DOWNLOAD_DIR, f"{task_id}_%(title).100B.%(ext)s")
@@ -232,7 +219,7 @@ def run_download(task_id: str, url: str, req: DownloadRequest, loop):
         files = [f for f in os.listdir(DOWNLOAD_DIR)
                  if f.startswith(task_id) and not f.endswith((".part", ".temp", ".ytdl"))]
         if not files:
-            raise FileNotFoundError("Arquivo nao encontrado apos download.")
+            raise FileNotFoundError("Arquivo não encontrado após download.")
 
         files.sort(key=lambda f: os.path.getsize(os.path.join(DOWNLOAD_DIR, f)), reverse=True)
         path = os.path.join(DOWNLOAD_DIR, files[0])
@@ -242,7 +229,7 @@ def run_download(task_id: str, url: str, req: DownloadRequest, loop):
                 "file_path": path, "status": "finished", "percent": 100
             })
 
-        emit({"status": "finished", "percent": 100, "message": "Concluido!"})
+        emit({"status": "finished", "percent": 100, "message": "Concluído!"})
         logger.info(f"[{task_id}] OK: {path}")
 
     except Exception as e:
@@ -273,7 +260,7 @@ async def progress(task_id: str):
     with state_lock:
         state = tasks_state.get(task_id)
     if not state:
-        raise HTTPException(status_code=404, detail="Tarefa nao encontrada")
+        raise HTTPException(status_code=404, detail="Tarefa não encontrada")
     return state
 
 
@@ -307,9 +294,9 @@ async def download_file(task_id: str):
         path = state.get("file_path") if state else None
 
     if not state:
-        raise HTTPException(status_code=404, detail="Tarefa nao encontrada")
+        raise HTTPException(status_code=404, detail="Tarefa não encontrada")
     if not path or not os.path.exists(path):
-        raise HTTPException(status_code=404, detail="Arquivo indisponivel")
+        raise HTTPException(status_code=404, detail="Arquivo indisponível")
 
     return FileResponse(
         path=path,
@@ -319,28 +306,9 @@ async def download_file(task_id: str):
 
 
 # ============================================================
-# LAUNCHER
+# START
 # ============================================================
-def open_browser(url: str):
-    import urllib.request
-    start = time.time()
-    while time.time() - start < 10:
-        try:
-            urllib.request.urlopen(url, timeout=1)
-            webbrowser.open(url)
-            return
-        except Exception:
-            time.sleep(0.3)
-    webbrowser.open(url)
-
-
-def main():
-    import uvicorn
-    url = "http://127.0.0.1:8000"
-    threading.Thread(target=open_browser, args=(url,), daemon=True).start()
-    logger.info(f"Servidor: {url}")
-    uvicorn.run(app, host="127.0.0.1", port=8000, reload=False, log_level="info")
-
-
 if __name__ == "__main__":
-    main()
+    import uvicorn
+    logger.info(f"Servidor: http://{HOST}:{PORT}")
+    uvicorn.run(app, host=HOST, port=PORT, reload=False, log_level="info")
