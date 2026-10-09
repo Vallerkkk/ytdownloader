@@ -1269,6 +1269,15 @@ btnGallery.addEventListener("click", saveToGallery);
    ========================================================= */
 renderQuality(formatSelect.value);
 
+fetch(`${API}/api/health`)
+  .then((r) => r.json())
+  .then((h) => {
+    if (!h.deno) {
+      toast("YouTube lento: Deno não está no PATH do servidor.", "error");
+    }
+  })
+  .catch(() => {});
+
 // Pede permissão de notificação silenciosamente após 2s
 setTimeout(() => {
   if ("Notification" in window && Notification.permission === "default") {

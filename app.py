@@ -72,6 +72,14 @@ def needs_proxy(url: str) -> bool:
         return False
 
 
+def youtube_wants_proxy(url: str) -> bool:
+    """YouTube no datacenter costuma precisar de proxy, mas o proxy é lento.
+    Default: tenta direto. YT_FORCE_PROXY=1 volta ao comportamento antigo."""
+    if not needs_proxy(url) or not PROXY_URL:
+        return False
+    return os.environ.get("YT_FORCE_PROXY", "").lower() in ("1", "true", "yes")
+
+
 # ============================================================
 # COOKIES
 # ============================================================
@@ -119,17 +127,40 @@ FFMPEG_LOCATION = find_ffmpeg()
 # ============================================================
 def find_deno() -> Optional[str]:
     deno = shutil.which("deno")
+    if not deno:
+        for candidate in ("/usr/local/bin/deno", "/root/.deno/bin/deno", "/usr/bin/deno"):
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                deno = candidate
+                break
     if deno:
         logger.info(f"✅ Deno: {deno}")
         d = os.path.dirname(deno)
         if d not in os.environ.get("PATH", ""):
             os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
         return deno
-    logger.warning("⚠️  Deno não encontrado")
+    logger.warning(
+        "⚠️  Deno não encontrado — YouTube vai throttlear (~50 KB/s). "
+        "Instale com DENO_INSTALL=/usr/local."
+    )
     return None
 
 
 DENO_PATH = find_deno()
+
+
+def _ejs_available() -> bool:
+    try:
+        import yt_dlp_ejs  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+EJS_OK = _ejs_available()
+if EJS_OK:
+    logger.info("✅ yt-dlp-ejs disponível (solver do challenge n)")
+else:
+    logger.warning("⚠️  yt-dlp-ejs ausente — YouTube pode continuar throttled")
 
 
 # ============================================================
@@ -159,6 +190,8 @@ async def health():
         "status": "ok",
         "ffmpeg": bool(FFMPEG_LOCATION),
         "deno": bool(DENO_PATH),
+        "deno_path": DENO_PATH,
+        "ejs": _ejs_available(),
         "cookies": bool(COOKIES_FILE),
         "proxy": bool(PROXY_URL),
         "server": IS_SERVER,
@@ -231,11 +264,22 @@ def base_opts(use_proxy: bool = True) -> Dict[str, Any]:
     if use_proxy and PROXY_URL:
         opts["proxy"] = PROXY_URL
 
-    opts["extractor_args"] = {
-        "youtube": {
-            "player_client": ["web_safari", "web", "android", "ios", "tv"],
-        },
-    }
+    # Sem o solver do parâmetro `n`, o CDN do YouTube entrega o mesmo arquivo
+    # a ~40–100 KB/s. Outros sites não passam por esse challenge, por isso
+    # só o YouTube parecia “capado”.
+    if DENO_PATH:
+        opts["js_runtimes"] = {"deno": {"path": DENO_PATH}}
+    if not EJS_OK:
+        opts["remote_components"] = ["ejs:github"]
+
+    # Não force 5 player clients: cada um é um round-trip antes do download.
+    # O default do yt-dlp acompanha o que o YouTube aceita hoje.
+    # Sobrescreva com YT_PLAYER_CLIENT=android,web se um client quebrar.
+    clients = os.environ.get("YT_PLAYER_CLIENT", "").strip()
+    if clients:
+        opts["extractor_args"] = {
+            "youtube": {"player_client": [c.strip() for c in clients.split(",") if c.strip()]},
+        }
     return opts
 
 
@@ -285,7 +329,7 @@ async def analyze(req: AnalyzeRequest):
         logger.info(f"✅ Cache hit: {url}")
         return cached["data"]
 
-    use_proxy = needs_proxy(url) and bool(PROXY_URL)
+    use_proxy = youtube_wants_proxy(url)
     logger.info(f"Proxy: {'SIM' if use_proxy else 'NÃO'} ({urlparse(url).hostname})")
 
     opts = base_opts(use_proxy=use_proxy)
@@ -315,6 +359,27 @@ async def analyze(req: AnalyzeRequest):
         return result
 
     except Exception as e:
+        if not use_proxy and PROXY_URL and needs_proxy(url):
+            logger.warning(f"Analyze sem proxy falhou, tentando com proxy: {e}")
+            opts_proxy = base_opts(use_proxy=True)
+            opts_proxy["extract_flat"] = False
+            opts_proxy["format"] = None
+            try:
+                info = await asyncio.to_thread(
+                    lambda: yt_dlp.YoutubeDL(opts_proxy).extract_info(url, download=False)
+                )
+                result = {
+                    "title": info.get("title", "Sem título"),
+                    "thumbnail": info.get("thumbnail", ""),
+                    "duration": info.get("duration", 0),
+                    "channel": info.get("uploader", info.get("channel", "Desconhecido")),
+                    "platform": info.get("extractor_key", "Web"),
+                }
+                analyze_cache[url] = {"ts": time.time(), "data": result}
+                return result
+            except Exception as e2:
+                logger.error(f"Erro analyze (proxy): {e2}")
+                raise HTTPException(status_code=400, detail=str(e2))
         logger.error(f"Erro analyze: {e}")
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -325,22 +390,31 @@ async def analyze(req: AnalyzeRequest):
 def run_preview(preview_id: str, url: str):
     """Baixa a pior qualidade do vídeo (rápido) para preview."""
     outtmpl = os.path.join(PREVIEW_DIR, f"{preview_id}.%(ext)s")
-    use_proxy = needs_proxy(url) and bool(PROXY_URL)
+    use_proxy = youtube_wants_proxy(url)
 
-    opts = base_opts(use_proxy=use_proxy)
-    opts.update({
-        "outtmpl": outtmpl,
-        # Pior qualidade = download rápido e pequeno
-        "format": "worst[ext=mp4]/worst[height<=360]/worst",
-        # Sem áudio (mais rápido ainda)
-        "postprocessors": [],
-    })
+    def _opts(with_proxy: bool):
+        opts = base_opts(use_proxy=with_proxy)
+        opts.update({
+            "outtmpl": outtmpl,
+            # Prévia: arquivo único progressivo, sem merge. No YouTube o "worst"
+            # DASH ainda sofre throttle e ainda por cima espera o ffmpeg.
+            "format": "b[ext=mp4][height<=360]/w[ext=mp4]/b[height<=360]/worst[ext=mp4]/worst",
+            "postprocessors": [],
+        })
+        return opts
 
     previews_state[preview_id]["status"] = "downloading"
 
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([url])
+        try:
+            with yt_dlp.YoutubeDL(_opts(use_proxy)) as ydl:
+                ydl.download([url])
+        except Exception:
+            if use_proxy or not PROXY_URL:
+                raise
+            logger.warning(f"[preview {preview_id}] Direto falhou, tentando proxy")
+            with yt_dlp.YoutubeDL(_opts(True)) as ydl:
+                ydl.download([url])
 
         files = [
             f for f in os.listdir(PREVIEW_DIR)
@@ -469,21 +543,34 @@ def run_download(task_id: str, url: str, req: DownloadRequest, loop, use_proxy: 
                 logger.info(f"[{task_id}] Áudio MP3 {bitrate}kbps")
 
         else:
+            # h264+aac remuxa com -c copy. VP9/AV1+opus força reencode e é o
+            # que deixa o YouTube “processando” por vários minutos depois dos 99%.
+            o["format_sort"] = ["res", "vcodec:h264", "acodec:aac", "ext:mp4", "proto:https"]
+            if needs_proxy(url):
+                o["concurrent_fragment_downloads"] = 16
+
             if req.quality == "best":
                 o["format"] = (
-                    "b[ext=mp4]/b"
-                    "/bv*+ba/bestvideo+bestaudio"
-                    "/best/worst"
+                    "bv*[vcodec^=avc1][ext=mp4]+ba[ext=m4a]"
+                    "/bv*[ext=mp4]+ba[ext=m4a]"
+                    "/b[ext=mp4]/bv*+ba/b"
                 )
             else:
                 q = req.quality
-                o["format"] = (
-                    f"b[ext=mp4][height<={q}]"
-                    f"/b[height<={q}]"
-                    f"/bv*[height<={q}]+ba/b[height<={q}]"
-                    f"/best[height<={q}]"
-                    f"/b/worst"
-                )
+                # Até 720p o progressivo (um arquivo só) costuma ser mais rápido
+                # que baixar DASH + mux. Acima disso o YouTube não serve progressivo.
+                if str(q) in ("480", "720"):
+                    o["format"] = (
+                        f"b[ext=mp4][height<={q}]/"
+                        f"bv*[vcodec^=avc1][height<={q}][ext=mp4]+ba[ext=m4a]/"
+                        f"bv*[height<={q}]+ba/b[height<={q}]/b"
+                    )
+                else:
+                    o["format"] = (
+                        f"bv*[vcodec^=avc1][height<={q}][ext=mp4]+ba[ext=m4a]/"
+                        f"bv*[ext=mp4][height<={q}]+ba[ext=m4a]/"
+                        f"bv*[height<={q}]+ba/b[height<={q}]/b"
+                    )
             o["merge_output_format"] = "mp4"
         return o
 
@@ -535,10 +622,11 @@ async def start_download(req: DownloadRequest):
     url = req.url.strip()
     task_id = str(uuid.uuid4())
 
-    use_proxy = needs_proxy(url) and bool(PROXY_URL)
+    use_proxy = youtube_wants_proxy(url)
     logger.info(
         f"[{task_id}] Iniciado: {url} | "
-        f"proxy={'SIM' if use_proxy else 'NÃO'} ({urlparse(url).hostname})"
+        f"proxy={'SIM' if use_proxy else 'NÃO'} ({urlparse(url).hostname}) | "
+        f"deno={'SIM' if DENO_PATH else 'NÃO'}"
     )
 
     with state_lock:
