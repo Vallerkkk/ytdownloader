@@ -166,7 +166,7 @@ else:
 # ============================================================
 # APP
 # ============================================================
-app = FastAPI(title="NeonVD API", version="2.4.0")
+app = FastAPI(title="NeonVD API", version="2.4.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -174,6 +174,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Disposition", "Content-Length"],
 )
 
 
@@ -316,6 +317,21 @@ def cleanup_previews(max_age_hours: int = 1):
         pass
 
 
+def ensure_extension(path: str, fallback: str = ".mp4") -> str:
+    """Garante que o arquivo tenha extensão — evita o navegador salvar como .txt
+    quando o mime cai em application/octet-stream."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext and ext not in (".unknown_video", ".part"):
+        return path
+    new_path = path + fallback
+    try:
+        os.rename(path, new_path)
+        logger.warning(f"Extensão corrigida: {path} → {new_path}")
+        return new_path
+    except Exception:
+        return path
+
+
 # ============================================================
 # ANALISAR
 # ============================================================
@@ -385,7 +401,7 @@ async def analyze(req: AnalyzeRequest):
 
 
 # ============================================================
-# PRÉ-VISUALIZAÇÃO (novo)
+# PRÉ-VISUALIZAÇÃO
 # ============================================================
 def run_preview(preview_id: str, url: str):
     """Baixa a pior qualidade do vídeo (rápido) para preview."""
@@ -396,8 +412,7 @@ def run_preview(preview_id: str, url: str):
         opts = base_opts(use_proxy=with_proxy)
         opts.update({
             "outtmpl": outtmpl,
-            # Prévia: arquivo único progressivo, sem merge. No YouTube o "worst"
-            # DASH ainda sofre throttle e ainda por cima espera o ffmpeg.
+            # Prévia: arquivo único progressivo, sem merge.
             "format": "b[ext=mp4][height<=360]/w[ext=mp4]/b[height<=360]/worst[ext=mp4]/worst",
             "postprocessors": [],
         })
@@ -424,6 +439,8 @@ def run_preview(preview_id: str, url: str):
             raise FileNotFoundError("Preview não encontrado")
 
         path = os.path.join(PREVIEW_DIR, files[0])
+        path = ensure_extension(path, ".mp4")
+
         previews_state[preview_id]["path"] = path
         previews_state[preview_id]["status"] = "ready"
         logger.info(f"[preview {preview_id}] OK: {path}")
@@ -439,7 +456,6 @@ async def start_preview(req: PreviewRequest):
     url = req.url.strip()
     preview_id = str(uuid.uuid4())
 
-    # Limpa previews antigos (evita encher disco)
     cleanup_previews(max_age_hours=1)
 
     with state_lock:
@@ -475,11 +491,13 @@ async def preview_file(preview_id: str):
     if not os.path.exists(path):
         raise HTTPException(status_code=404, detail="Arquivo de preview não encontrado")
 
+    # Deixa o Starlette montar o Content-Disposition (RFC 5987 correto)
     return FileResponse(
         path=path,
+        filename=os.path.basename(path),
         media_type=get_mime_type(path),
+        content_disposition_type="inline",
         headers={
-            "Content-Disposition": "inline",
             "Accept-Ranges": "bytes",
             "Cache-Control": "private, max-age=3600",
         },
@@ -490,7 +508,8 @@ async def preview_file(preview_id: str):
 # DOWNLOAD — worker em thread
 # ============================================================
 def run_download(task_id: str, url: str, req: DownloadRequest, loop, use_proxy: bool = True):
-    outtmpl = os.path.join(DOWNLOAD_DIR, f"{task_id}_%(title).100B.%(ext)s")
+    # ⚠️  .80s (chars) e não .100B (bytes) — evita truncar no meio de UTF-8
+    outtmpl = os.path.join(DOWNLOAD_DIR, f"{task_id}_%(title).80s.%(ext)s")
 
     def emit(data: dict):
         with state_lock:
@@ -525,14 +544,11 @@ def run_download(task_id: str, url: str, req: DownloadRequest, loop, use_proxy: 
         o.update({"outtmpl": outtmpl, "progress_hooks": [hook]})
 
         if req.format == "audio":
-            # 🆕 Modo rápido: mantém formato original (m4a/opus) sem reencoding
+            # Modo rápido: mantém formato original (m4a/opus) sem reencoding
             if req.quality == "audio-original":
                 o["format"] = "ba[ext=m4a]/ba[ext=opus]/ba[ext=webm]/ba/b"
-                # Sem postprocessors = MUITO mais rápido
                 logger.info(f"[{task_id}] Áudio ORIGINAL (sem conversão)")
-
             else:
-                # Modo normal: converte para MP3
                 bitrate = req.quality.replace("audio-", "") if "audio-" in req.quality else "192"
                 o["format"] = "ba/b/bestaudio/best"
                 o["postprocessors"] = [{
@@ -543,8 +559,6 @@ def run_download(task_id: str, url: str, req: DownloadRequest, loop, use_proxy: 
                 logger.info(f"[{task_id}] Áudio MP3 {bitrate}kbps")
 
         else:
-            # h264+aac remuxa com -c copy. VP9/AV1+opus força reencode e é o
-            # que deixa o YouTube “processando” por vários minutos depois dos 99%.
             o["format_sort"] = ["res", "vcodec:h264", "acodec:aac", "ext:mp4", "proto:https"]
             if needs_proxy(url):
                 o["concurrent_fragment_downloads"] = 16
@@ -557,8 +571,6 @@ def run_download(task_id: str, url: str, req: DownloadRequest, loop, use_proxy: 
                 )
             else:
                 q = req.quality
-                # Até 720p o progressivo (um arquivo só) costuma ser mais rápido
-                # que baixar DASH + mux. Acima disso o YouTube não serve progressivo.
                 if str(q) in ("480", "720"):
                     o["format"] = (
                         f"b[ext=mp4][height<={q}]/"
@@ -603,6 +615,10 @@ def run_download(task_id: str, url: str, req: DownloadRequest, loop, use_proxy: 
 
         files.sort(key=lambda f: os.path.getsize(os.path.join(DOWNLOAD_DIR, f)), reverse=True)
         path = os.path.join(DOWNLOAD_DIR, files[0])
+
+        # ⚠️  Garante extensão coerente (evita .txt no navegador)
+        fallback_ext = ".mp3" if req.format == "audio" else ".mp4"
+        path = ensure_extension(path, fallback_ext)
 
         with state_lock:
             tasks_state[task_id].update({
@@ -691,16 +707,25 @@ async def download_file(task_id: str, inline: bool = False):
     if not path or not os.path.exists(path):
         raise HTTPException(status_code=404, detail="Arquivo indisponível")
 
-    clean_name = os.path.basename(path).replace(f"{task_id}_", "", 1)
-    media_type = get_mime_type(clean_name)
-    disposition = "inline" if inline else "attachment"
+    # Remove o prefixo UUID do nome exibido
+    base = os.path.basename(path)
+    clean_name = base.replace(f"{task_id}_", "", 1) or base
 
+    # Garante extensão no nome exibido (defesa extra)
+    if not os.path.splitext(clean_name)[1]:
+        clean_name += ".mp4"
+
+    media_type = get_mime_type(clean_name)
+
+    # ⚠️  CRÍTICO: NÃO passe "Content-Disposition" em headers.
+    # Deixe o Starlette gerar — ele usa RFC 5987 (filename*=utf-8''...)
+    # que lida corretamente com acentos, emojis e aspas.
     return FileResponse(
         path=path,
         filename=clean_name,
         media_type=media_type,
+        content_disposition_type="inline" if inline else "attachment",
         headers={
-            "Content-Disposition": f'{disposition}; filename="{clean_name}"',
             "Access-Control-Expose-Headers": "Content-Disposition, Content-Length",
             "Cache-Control": "private, max-age=3600",
         },

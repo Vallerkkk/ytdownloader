@@ -781,6 +781,23 @@ function busy(btn, on, label = "Aguarde") {
   }
 }
 
+/* ---------------------------------------------------------
+   EXTRAI NOME DE ARQUIVO DO Content-Disposition (RFC 5987)
+   Prioriza filename*=utf-8''... que o Starlette emite.
+   --------------------------------------------------------- */
+function extractFilename(disposition, fallback = "video.mp4") {
+  if (!disposition) return fallback;
+  // RFC 5987: filename*=utf-8''nome%20codificado.mp4
+  let m = disposition.match(/filename\*\s*=\s*([^']+)'[^']*'([^;\n]+)/i);
+  if (m) {
+    try { return decodeURIComponent(m[2].trim()); } catch {}
+  }
+  // Fallback: filename="nome.mp4"
+  m = disposition.match(/filename\s*=\s*"?([^";\n]+)"?/i);
+  if (m) return m[1].trim();
+  return fallback;
+}
+
 function renderQuality(fmt) {
   if (fmt === "audio") {
     qualitySel.innerHTML = `
@@ -802,7 +819,7 @@ function renderQuality(fmt) {
 formatSelect.addEventListener("change", (e) => renderQuality(e.target.value));
 
 /* =========================================================
-   NOTIFICAÇÕES DO NAVEGADOR (novo)
+   NOTIFICAÇÕES DO NAVEGADOR
    ========================================================= */
 async function requestNotifications() {
   if (!("Notification" in window)) {
@@ -857,7 +874,6 @@ urlForm.addEventListener("submit", async (e) => {
     return;
   }
 
-  // Pede permissão de notificação na primeira análise
   if (!notificationsEnabled) requestNotifications();
 
   preview.classList.add("hidden");
@@ -867,7 +883,6 @@ urlForm.addEventListener("submit", async (e) => {
   loadingArea.classList.remove("hidden");
   busy(btnAnalyze, true, "Analisando…");
 
-  // Limpa preview anterior
   resetPreview();
 
   try {
@@ -900,10 +915,9 @@ urlForm.addEventListener("submit", async (e) => {
 });
 
 /* =========================================================
-   PRÉ-VISUALIZAÇÃO (novo)
+   PRÉ-VISUALIZAÇÃO
    ========================================================= */
 function resetPreview() {
-  // Esconde o video player e mostra a thumbnail novamente
   previewVideo.classList.add("hidden");
   previewVideo.src = "";
   thumbEl.classList.remove("hidden");
@@ -923,7 +937,6 @@ btnPreview.addEventListener("click", async () => {
   const url = urlInput.value.trim();
   if (!url) return toast("Analise um vídeo primeiro.", "error");
 
-  // Se já tem preview carregado, é só play/pause
   if (currentPreviewId && previewVideo.src) {
     if (previewVideo.paused) previewVideo.play();
     else previewVideo.pause();
@@ -981,7 +994,6 @@ function pollPreviewStatus(previewId) {
           <span>Pré-visualizar vídeo</span>
         `;
       }
-      // Se ainda está "downloading", continua polling
     } catch (e) {
       console.warn("Erro ao checar preview:", e);
     }
@@ -989,13 +1001,11 @@ function pollPreviewStatus(previewId) {
 }
 
 function showPreviewVideo(previewId) {
-  // Troca thumbnail por player de vídeo
   thumbEl.classList.add("hidden");
   previewVideo.classList.remove("hidden");
   previewVideo.src = `${API}/api/preview-file/${previewId}`;
   previewMedia.classList.add("playing");
 
-  // Atualiza botão
   btnPreview.disabled = false;
   btnPreview.innerHTML = `
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
@@ -1004,7 +1014,6 @@ function showPreviewVideo(previewId) {
     <span>Play / Pause</span>
   `;
 
-  // Tenta autoplay (pode ser bloqueado pelo navegador)
   previewVideo.play().catch(() => {});
 
   toast("Preview pronto", "success");
@@ -1017,7 +1026,6 @@ btnDownload.addEventListener("click", async () => {
   const url = urlInput.value.trim();
   if (!url) return toast("Nenhuma URL.", "error");
 
-  // Pede permissão se ainda não pediu
   if (!notificationsEnabled) requestNotifications();
 
   progressBox.classList.remove("hidden");
@@ -1135,7 +1143,6 @@ function applyProgress(data) {
     showSaveButtons();
     toast("Download finalizado.", "success");
 
-    // 🔔 Notificação do navegador
     notify("NeonVD — Download concluído", currentVideoTitle || "Seu vídeo está pronto");
 
     try { socket && socket.close(); } catch {}
@@ -1146,7 +1153,6 @@ function applyProgress(data) {
     busy(btnDownload, false);
     toast(`Falha: ${data.message || "erro"}`, "error");
 
-    // 🔔 Notifica erro também
     notify("NeonVD — Falha no download", data.message || "Erro desconhecido");
 
     try { socket && socket.close(); } catch {}
@@ -1178,12 +1184,16 @@ function showSaveButtons() {
 
 /* =========================================================
    DOWNLOAD CLÁSSICO
+   ---------------------------------------------------------
+   ⚠️  NÃO definir a.download = "" — string vazia faz alguns
+   navegadores salvarem como .txt. Sem o atributo, o browser
+   usa o filename do Content-Disposition (Starlette já emite
+   com RFC 5987, seguro para unicode/acentos/emoji).
    ========================================================= */
 function triggerClassicDownload() {
   const a = document.createElement("a");
   a.href = `${API}/api/download-file/${currentTaskId}`;
   a.rel = "noopener";
-  a.download = "";
   document.body.appendChild(a);
   a.click();
   a.remove();
@@ -1222,9 +1232,8 @@ async function saveToGallery() {
     if (!res.ok) throw new Error("Falha ao baixar arquivo");
 
     const disposition = res.headers.get("Content-Disposition") || "";
-    let filename = "video.mp4";
-    const match = disposition.match(/filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/);
-    if (match && match[1]) filename = match[1].replace(/['"]/g, "");
+    const fallbackName = formatSelect.value === "audio" ? "audio.m4a" : "video.mp4";
+    const filename = extractFilename(disposition, fallbackName);
 
     const blob = await res.blob();
 
@@ -1278,10 +1287,8 @@ fetch(`${API}/api/health`)
   })
   .catch(() => {});
 
-// Pede permissão de notificação silenciosamente após 2s
 setTimeout(() => {
   if ("Notification" in window && Notification.permission === "default") {
-    // Não pede automaticamente, só marca como disponível
     console.log("Notificações disponíveis — serão pedidas no primeiro uso");
   }
 }, 2000);
